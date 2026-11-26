@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/setup-tool]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck and dry-run
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Shellcheck
+        run: shellcheck -s bash macserve
+
+      - name: Dry-run setup, status, and undo
+        run: |
+          set -euo pipefail
+          ./macserve version
+          ./macserve --dry-run setup
+          ./macserve --dry-run status
+          ./macserve status
+          ./macserve --dry-run undo
+
+      - name: add-key against a temp HOME
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          export HOME="${tmp}/home"
+          mkdir -p "${HOME}"
+          ssh-keygen -t ed25519 -f "${tmp}/id" -N "" -C "ci@macserve"
+          ssh-keygen -t ed25519 -f "${tmp}/id2" -N "" -C "ci2@macserve"
+
+          ./macserve --dry-run add-key "${tmp}/id.pub"
+          ./macserve add-key "${tmp}/id.pub"
+          ./macserve add-key "${tmp}/id.pub"
+
+          count="$(awk 'BEGIN{n=0} /^[[:space:]]*$/{next} /^#/{next} {n++} END{print n+0}' "${HOME}/.ssh/authorized_keys")"
+          test "${count}" = "1"
+
+          ./macserve add-key "$(cat "${tmp}/id2.pub")"
+          count="$(awk 'BEGIN{n=0} /^[[:space:]]*$/{next} /^#/{next} {n++} END{print n+0}' "${HOME}/.ssh/authorized_keys")"
+          test "${count}" = "2"
+
+          test "$(stat -f '%OLp' "${HOME}/.ssh")" = "700"
+          test "$(stat -f '%OLp' "${HOME}/.ssh/authorized_keys")" = "600"
+
+          ./macserve --dry-run undo
+          ./macserve --yes undo
+          count="$(awk 'BEGIN{n=0} /^[[:space:]]*$/{next} /^#/{next} {n++} END{print n+0}' "${HOME}/.ssh/authorized_keys")"
+          test "${count}" = "0"

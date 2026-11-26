@@ -1,0 +1,832 @@
+#!/usr/bin/env bash
+# macserve — set up a Mac as a hardened SSH server
+# Copyright (c) 2026 Joshua Almeida
+set -euo pipefail
+
+VERSION="0.1.0"
+DROPIN_PATH="/etc/ssh/sshd_config.d/100-macserve.conf"
+STATE_DIR="${MACSERVE_STATE_DIR:-${HOME}/.macserve}"
+STATE_FILE="${STATE_DIR}/state"
+DISK_WARN_GB=5
+
+DRY_RUN=0
+ASSUME_YES=0
+COMMAND=""
+# Remaining args after flag/command parse, as a newline-delimited string
+# is awkward; use a bash 3.2 array instead.
+POSITIONAL=()
+
+usage() {
+  cat <<'EOF'
+macserve — set up a Mac as a hardened SSH server
+
+Usage:
+  macserve [options] <command> [args]
+
+Commands:
+  setup                 Enable Remote Login, harden sshd, keep the Mac
+                        awake on AC power, and set auto-restart after a
+                        power failure. Prints Tailscale install steps.
+  add-key <key|file>    Append an SSH public key to ~/.ssh/authorized_keys
+                        with the right permissions. Duplicate keys are skipped.
+  status                Show Remote Login state, LAN IP, Tailscale IP if
+                        any, free disk space, sleep settings, and key count.
+  undo                  Revert every change macserve recorded.
+  help                  Show this help.
+  version               Show the version.
+
+Options:
+  --dry-run             Print the commands that would run, without running them.
+  -y, --yes             Do not ask before each sudo change.
+  -h, --help            Show this help.
+
+Options may appear before or after the command. By default, setup and undo
+ask before every change that needs sudo.
+EOF
+}
+
+die() {
+  printf 'macserve: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+is_darwin() {
+  [[ "$(uname -s)" == "Darwin" ]]
+}
+
+# Print a command the way --dry-run should show it.
+show_cmd() {
+  # shellcheck disable=SC2145
+  printf '+ %s\n' "$*"
+}
+
+# Run a command, or print it under --dry-run.
+run_cmd() {
+  show_cmd "$@"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    return 0
+  fi
+  "$@"
+}
+
+have_tty() {
+  [[ -t 0 ]] || [[ -r /dev/tty ]]
+}
+
+# Ask before a sudo (or otherwise privileged) change. Returns 0 to proceed.
+confirm() {
+  local prompt="$1"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "${ASSUME_YES}" -eq 1 ]]; then
+    return 0
+  fi
+  if ! have_tty; then
+    die "non-interactive session: pass --yes to apply changes, or --dry-run to preview them"
+  fi
+  local ans=""
+  if [[ -t 0 ]]; then
+    printf '%s [y/N] ' "${prompt}"
+    read -r ans || true
+  else
+    printf '%s [y/N] ' "${prompt}" > /dev/tty
+    read -r ans < /dev/tty || true
+  fi
+  case "${ans}" in
+    y|Y|yes|YES) return 0 ;;
+    *)
+      info "Skipped."
+      return 1
+      ;;
+  esac
+}
+
+ensure_state_dir() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    show_cmd mkdir -p "${STATE_DIR}"
+    show_cmd chmod 700 "${STATE_DIR}"
+    return 0
+  fi
+  mkdir -p "${STATE_DIR}"
+  chmod 700 "${STATE_DIR}"
+}
+
+# Record one change. Fields are tab-separated after the type.
+# Lines: TIMESTAMP <TAB> TYPE <TAB> payload...
+record_change() {
+  local typ="$1"
+  shift
+  local ts
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    printf '+ record %s' "${typ}"
+    if [[ "$#" -gt 0 ]]; then
+      printf ' %s' "$@"
+    fi
+    printf '\n'
+    return 0
+  fi
+  ensure_state_dir
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    printf '# macserve state v1\n' > "${STATE_FILE}"
+    chmod 600 "${STATE_FILE}"
+  fi
+  {
+    printf '%s\t%s' "${ts}" "${typ}"
+    if [[ "$#" -gt 0 ]]; then
+      printf '\t%s' "$@"
+    fi
+    printf '\n'
+  } >> "${STATE_FILE}"
+}
+
+# ---------- probes ----------
+
+remote_login_state() {
+  local out=""
+  if command -v /usr/sbin/systemsetup >/dev/null 2>&1; then
+    out="$(/usr/sbin/systemsetup -getremotelogin 2>/dev/null || true)"
+    case "${out}" in
+      *[Oo]n*)  printf 'on'; return 0 ;;
+      *[Oo]ff*) printf 'off'; return 0 ;;
+    esac
+  fi
+  if command -v launchctl >/dev/null 2>&1; then
+    if launchctl print system/com.openssh.sshd >/dev/null 2>&1; then
+      printf 'on'
+      return 0
+    fi
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:22 -sTCP:LISTEN >/dev/null 2>&1; then
+      printf 'on'
+      return 0
+    fi
+  fi
+  printf 'unknown'
+}
+
+lan_ip() {
+  local iface="" ip=""
+  if command -v route >/dev/null 2>&1; then
+    iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    if [[ -n "${iface}" ]] && command -v ipconfig >/dev/null 2>&1; then
+      ip="$(ipconfig getifaddr "${iface}" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "${ip}" ]] && command -v ipconfig >/dev/null 2>&1; then
+    local i
+    for i in en0 en1 en2 en3 en4 en5; do
+      ip="$(ipconfig getifaddr "${i}" 2>/dev/null || true)"
+      if [[ -n "${ip}" ]]; then
+        break
+      fi
+    done
+  fi
+  if [[ -z "${ip}" ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "${ip}" ]]; then
+    printf 'none'
+  else
+    printf '%s' "${ip}"
+  fi
+}
+
+tailscale_ip() {
+  local ip=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "${ip}" ]] && command -v /Applications/Tailscale.app/Contents/MacOS/Tailscale >/dev/null 2>&1; then
+    ip="$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "${ip}" ]]; then
+    printf 'none'
+  else
+    printf '%s' "${ip}"
+  fi
+}
+
+# Free space on / in gigabytes, integer (truncated). Prints empty on failure.
+free_disk_gb() {
+  local avail=""
+  if ! command -v df >/dev/null 2>&1; then
+    return 0
+  fi
+  # macOS: df -g uses 1G blocks. Linux GNU df has -BG.
+  if df -g / >/dev/null 2>&1; then
+    avail="$(df -g / 2>/dev/null | awk 'NR==2 {print $4; exit}')"
+  elif df -BG / >/dev/null 2>&1; then
+    avail="$(df -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4; exit}')"
+  else
+    avail="$(df -k / 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024; exit}')"
+  fi
+  printf '%s' "${avail}"
+}
+
+# Human-readable free space, e.g. "12 GB" or "152 MB".
+free_disk_human() {
+  local kb=""
+  kb="$(df -k / 2>/dev/null | awk 'NR==2 {print $4; exit}')"
+  if [[ -z "${kb}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  if [[ "${kb}" -ge 1048576 ]]; then
+    awk -v k="${kb}" 'BEGIN { printf "%.1f GB", k/1024/1024 }'
+  else
+    awk -v k="${kb}" 'BEGIN { printf "%d MB", int(k/1024) }'
+  fi
+}
+
+authorized_keys_path() {
+  printf '%s/.ssh/authorized_keys' "${HOME}"
+}
+
+# Count non-empty, non-comment pubkey lines.
+authorized_key_count() {
+  local path
+  path="$(authorized_keys_path)"
+  if [[ ! -f "${path}" ]]; then
+    printf '0'
+    return 0
+  fi
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ { next }
+    { n++ }
+    END { print n+0 }
+  ' "${path}"
+}
+
+pmset_value() {
+  local key="$1"
+  if ! command -v pmset >/dev/null 2>&1; then
+    printf 'n/a'
+    return 0
+  fi
+  # Match the first field case-insensitively, exact token (not displaysleep
+  # when asking for sleep).
+  pmset -g 2>/dev/null | awk -v key="${key}" '
+    BEGIN { kl = tolower(key) }
+    {
+      k = $1
+      gsub(/[[:space:]]/, "", k)
+      if (tolower(k) == kl) { print $2; found=1; exit }
+    }
+    END { if (!found) print "unknown" }
+  '
+}
+
+# ---------- sshd drop-in ----------
+
+dropin_contents() {
+  cat <<'EOF'
+# Managed by macserve. Do not edit; use `macserve undo` to remove.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+EOF
+}
+
+sshd_include_present() {
+  local cfg="/etc/ssh/sshd_config"
+  if [[ ! -r "${cfg}" ]]; then
+    # If we cannot read it, assume modern macOS includes the drop-in dir.
+    return 0
+  fi
+  grep -Eq '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "${cfg}"
+}
+
+reload_sshd() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    show_cmd sudo sshd -t
+    show_cmd sudo launchctl kickstart -k system/com.openssh.sshd
+    return 0
+  fi
+  if command -v sshd >/dev/null 2>&1; then
+    sudo sshd -t
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sudo /usr/sbin/sshd -t
+  fi
+  if command -v launchctl >/dev/null 2>&1; then
+    sudo launchctl kickstart -k system/com.openssh.sshd
+  fi
+}
+
+# ---------- commands ----------
+
+cmd_status() {
+  local rl lan ts disk_h disk_gb keys sleepv diskv arv os
+  os="$(uname -s)"
+  rl="$(remote_login_state)"
+  lan="$(lan_ip)"
+  ts="$(tailscale_ip)"
+  disk_h="$(free_disk_human)"
+  disk_gb="$(free_disk_gb)"
+  keys="$(authorized_key_count)"
+  sleepv="$(pmset_value sleep)"
+  diskv="$(pmset_value disksleep)"
+  arv="$(pmset_value autorestart)"
+
+  info "macserve ${VERSION}"
+  info "Host:            $(hostname -s 2>/dev/null || hostname)"
+  info "User:            ${USER:-$(id -un)}"
+  info "OS:              ${os}"
+  info "Remote Login:    ${rl}"
+  info "LAN IP:          ${lan}"
+  info "Tailscale IP:    ${ts}"
+  if [[ -n "${disk_gb}" && "${disk_gb}" != "unknown" ]]; then
+    if awk -v g="${disk_gb}" -v w="${DISK_WARN_GB}" 'BEGIN { exit !(g+0 < w) }'; then
+      info "Free disk:       ${disk_h}  (warning: under ${DISK_WARN_GB} GB)"
+    else
+      info "Free disk:       ${disk_h}"
+    fi
+  else
+    info "Free disk:       ${disk_h}"
+  fi
+  if command -v pmset >/dev/null 2>&1; then
+    info "Sleep (current): ${sleepv}"
+    info "Disk sleep:      ${diskv}"
+    info "Autorestart:     ${arv}"
+  else
+    info "Sleep settings:  n/a (pmset not available)"
+  fi
+  info "Authorized keys: ${keys}  ($(authorized_keys_path))"
+  if [[ -f "${STATE_FILE}" ]]; then
+    local nchanges
+    nchanges="$(awk 'BEGIN{n=0} /^[[:space:]]*#/ {next} /^[[:space:]]*$/ {next} {n++} END{print n+0}' "${STATE_FILE}")"
+    info "Recorded changes:${nchanges}  (${STATE_FILE})"
+  else
+    info "Recorded changes:0  (no state file yet)"
+  fi
+}
+
+install_sshd_dropin() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    show_cmd sudo tee "${DROPIN_PATH}"
+    dropin_contents | sed 's/^/  /'
+    show_cmd sudo chmod 644 "${DROPIN_PATH}"
+    if ! sshd_include_present; then
+      info "note: /etc/ssh/sshd_config may need: Include /etc/ssh/sshd_config.d/*"
+    fi
+    reload_sshd
+    return 0
+  fi
+
+  if [[ -f "${DROPIN_PATH}" ]]; then
+    local existing tmp
+    existing="$(cat "${DROPIN_PATH}" 2>/dev/null || sudo cat "${DROPIN_PATH}")"
+    tmp="$(dropin_contents)"
+    if [[ "${existing}" == "${tmp}" ]]; then
+      info "sshd drop-in already in place at ${DROPIN_PATH}"
+      return 0
+    fi
+    if ! confirm "Replace existing ${DROPIN_PATH} with the macserve hardening drop-in?"; then
+      return 0
+    fi
+    ensure_state_dir
+    local backup
+    backup="$(mktemp "${STATE_DIR}/sshd-dropin-backup.XXXXXX")"
+    sudo cat "${DROPIN_PATH}" | tee "${backup}" >/dev/null
+    chmod 600 "${backup}"
+    record_change sshd_dropin replace "${DROPIN_PATH}" "${backup}"
+  else
+    if ! confirm "Install sshd hardening drop-in at ${DROPIN_PATH} (key-only auth, no root login)?"; then
+      return 0
+    fi
+    record_change sshd_dropin create "${DROPIN_PATH}"
+  fi
+
+  if ! sshd_include_present; then
+    info "warning: /etc/ssh/sshd_config does not appear to Include sshd_config.d; the drop-in may be ignored."
+  fi
+
+  dropin_contents | sudo tee "${DROPIN_PATH}" >/dev/null
+  sudo chmod 644 "${DROPIN_PATH}"
+  info "Wrote ${DROPIN_PATH}"
+
+  if confirm "Reload sshd to apply hardening?"; then
+    reload_sshd
+    info "sshd reloaded."
+  fi
+}
+
+cmd_setup() {
+  if [[ "${DRY_RUN}" -eq 0 ]] && ! is_darwin; then
+    die "setup must run on macOS (use --dry-run to preview the commands elsewhere)"
+  fi
+
+  info "macserve setup (dry-run=${DRY_RUN})"
+
+  # 1. Remote Login
+  local rl
+  rl="$(remote_login_state)"
+  if [[ "${rl}" == "on" && "${DRY_RUN}" -eq 0 ]]; then
+    info "Remote Login is already on."
+  else
+    if confirm "Enable Remote Login (SSH) with: sudo systemsetup -setremotelogin on?"; then
+      record_change remotelogin "${rl}"
+      run_cmd sudo /usr/sbin/systemsetup -setremotelogin on
+    fi
+  fi
+
+  # 2. sshd hardening
+  install_sshd_dropin
+
+  # 3. Stay awake on AC power
+  local prev_sleep prev_disk prev_ar
+  prev_sleep="$(pmset_value sleep)"
+  prev_disk="$(pmset_value disksleep)"
+  prev_ar="$(pmset_value autorestart)"
+
+  if [[ "${prev_sleep}" == "0" && "${DRY_RUN}" -eq 0 ]]; then
+    info "System sleep on the current power source is already 0."
+  else
+    if confirm "Keep the Mac awake on AC power (sudo pmset -c sleep 0)?"; then
+      record_change pmset -c sleep "${prev_sleep}"
+      run_cmd sudo pmset -c sleep 0
+    fi
+  fi
+
+  if [[ "${prev_disk}" == "0" && "${DRY_RUN}" -eq 0 ]]; then
+    info "Disk sleep on the current power source is already 0."
+  else
+    if confirm "Disable disk sleep on AC power (sudo pmset -c disksleep 0)?"; then
+      record_change pmset -c disksleep "${prev_disk}"
+      run_cmd sudo pmset -c disksleep 0
+    fi
+  fi
+
+  # 4. Auto-restart after power failure
+  if [[ "${prev_ar}" == "1" && "${DRY_RUN}" -eq 0 ]]; then
+    info "Auto-restart after power failure is already on."
+  else
+    if confirm "Restart automatically after a power failure (sudo pmset -c autorestart 1)?"; then
+      record_change pmset -c autorestart "${prev_ar}"
+      run_cmd sudo pmset -c autorestart 1
+    fi
+  fi
+
+  # 5. Tailscale (optional)
+  print_tailscale_steps
+  maybe_install_tailscale
+
+  info "Setup finished. Run './macserve status' to review this Mac's addresses."
+}
+
+print_tailscale_steps() {
+  cat <<'EOF'
+
+Tailscale is optional. It is not needed on the same Wi-Fi, but it is the
+simplest way to reach this Mac from anywhere:
+
+  1. Install Tailscale on the Mac: https://tailscale.com/download/mac
+     or, if you use Homebrew: brew install --cask tailscale
+  2. Open Tailscale and sign in.
+  3. Install the Tailscale Android app (or Tailscale in Termux) and sign
+     in to the same tailnet.
+  4. Connect with: ssh USER@TAILSCALE-IP
+     Run 'macserve status' on the Mac to see the Tailscale IP.
+
+EOF
+}
+
+maybe_install_tailscale() {
+  if command -v tailscale >/dev/null 2>&1 || [[ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+    info "Tailscale is already installed."
+    return 0
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    info "Homebrew is not installed; use the download link above if you want Tailscale."
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    info "If you said yes, would run: brew install --cask tailscale"
+    return 0
+  fi
+  if confirm "Install Tailscale now with Homebrew (brew install --cask tailscale)?"; then
+    run_cmd brew install --cask tailscale
+    record_change tailscale_brew installed
+  fi
+}
+
+# Return 0 if $1 looks like a single OpenSSH public key line.
+is_pubkey_line() {
+  local line="$1"
+  case "${line}" in
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-nistp256\ *|ecdsa-sha2-nistp384\ *|ecdsa-sha2-nistp521\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *)
+      # Need at least type + key material.
+      awk '{ exit !($1 != "" && $2 != "") }' <<<"${line}"
+      return $?
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+key_id() {
+  # type + material, ignoring the comment
+  awk '{ print $1 " " $2 }' <<<"$1"
+}
+
+# Collect pubkey lines from a file or from a literal key string.
+# Prints one key per line to stdout.
+collect_keys() {
+  local arg="$1"
+  if [[ -f "${arg}" ]]; then
+    local line
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%$'\r'}"
+      case "${line}" in
+        ''|\#*) continue ;;
+      esac
+      if is_pubkey_line "${line}"; then
+        printf '%s\n' "${line}"
+      else
+        die "not a recognized SSH public key line in ${arg}: ${line}"
+      fi
+    done < "${arg}"
+    return 0
+  fi
+  # Literal key (possibly passed with a comment).
+  if is_pubkey_line "${arg}"; then
+    printf '%s\n' "${arg}"
+    return 0
+  fi
+  die "add-key expects an SSH public key or a file containing one: ${arg}"
+}
+
+cmd_add_key() {
+  if [[ "$#" -lt 1 ]]; then
+    die "add-key requires a public key string or a file path"
+  fi
+  local input="$1"
+  local keys_file auth_dir
+  keys_file="$(authorized_keys_path)"
+  auth_dir="$(dirname "${keys_file}")"
+
+  local key_lines=()
+  local line collected
+  collected="$(mktemp "${TMPDIR:-/tmp}/macserve-keys.XXXXXX")"
+  # Run in this shell so collect_keys can die() on a bad line.
+  collect_keys "${input}" > "${collected}"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && key_lines+=("${line}")
+  done < "${collected}"
+  rm -f "${collected}"
+
+  if [[ "${#key_lines[@]}" -eq 0 ]]; then
+    die "no public keys found in ${input}"
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    show_cmd mkdir -p "${auth_dir}"
+    show_cmd chmod 700 "${auth_dir}"
+    show_cmd touch "${keys_file}"
+    show_cmd chmod 600 "${keys_file}"
+    local k
+    for k in "${key_lines[@]}"; do
+      printf '+ append to %s: %s\n' "${keys_file}" "${k}"
+    done
+    return 0
+  fi
+
+  mkdir -p "${auth_dir}"
+  chmod 700 "${auth_dir}"
+  if [[ ! -f "${keys_file}" ]]; then
+    touch "${keys_file}"
+  fi
+  chmod 600 "${keys_file}"
+
+  local added=0 skipped=0
+  for line in "${key_lines[@]}"; do
+    local id existing=""
+    id="$(key_id "${line}")"
+    existing="$(awk '{print $1 " " $2}' "${keys_file}" 2>/dev/null || true)"
+    if printf '%s\n' "${existing}" | grep -Fxq -- "${id}"; then
+      info "Already authorized, skipping: ${id}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    printf '%s\n' "${line}" >> "${keys_file}"
+    chmod 600 "${keys_file}"
+    record_change authorized_key "${id}"
+    info "Added: ${id}"
+    added=$((added + 1))
+  done
+  info "add-key done (${added} added, ${skipped} already present)."
+}
+
+# Remove an authorized key by type+material from a file.
+remove_authorized_key() {
+  local id="$1"
+  local keys_file
+  keys_file="$(authorized_keys_path)"
+  if [[ ! -f "${keys_file}" ]]; then
+    info "No authorized_keys file at ${keys_file}"
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    printf '+ remove key %s from %s\n' "${id}" "${keys_file}"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/macserve-ak.XXXXXX")"
+  awk -v id="${id}" '{
+    key = $1 " " $2
+    if (key == id) { removed=1; next }
+    print
+  }
+  END { exit 0 }
+  ' "${keys_file}" > "${tmp}"
+  chmod 600 "${tmp}"
+  mv "${tmp}" "${keys_file}"
+  chmod 600 "${keys_file}"
+  info "Removed authorized key: ${id}"
+}
+
+cmd_undo() {
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      info "No state file at ${STATE_FILE}; nothing to undo."
+      return 0
+    fi
+    info "No state file at ${STATE_FILE}; nothing to undo."
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 0 ]] && ! is_darwin; then
+    # Keys can still be undone off-macOS; system changes cannot.
+    :
+  fi
+
+  # Collect change lines (skip comments/blanks) in reverse order.
+  local lines=()
+  local line
+  while IFS= read -r line; do
+    case "${line}" in
+      ''|\#*) continue ;;
+    esac
+    lines+=("${line}")
+  done < "${STATE_FILE}"
+
+  if [[ "${#lines[@]}" -eq 0 ]]; then
+    info "State file has no recorded changes."
+    return 0
+  fi
+
+  info "macserve undo (dry-run=${DRY_RUN}): ${#lines[@]} recorded change(s), last first."
+
+  local i
+  for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
+    undo_one_line "${lines[$i]}"
+  done
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    show_cmd mv "${STATE_FILE}" "${STATE_FILE}.undone"
+    return 0
+  fi
+
+  local undone
+  undone="${STATE_FILE}.undone.$(date '+%Y%m%d%H%M%S')"
+  mv "${STATE_FILE}" "${undone}"
+  chmod 600 "${undone}" 2>/dev/null || true
+  info "State archived at ${undone}"
+}
+
+undo_one_line() {
+  local rec="$1"
+  # timestamp TAB type TAB rest...
+  local typ payload
+  typ="$(printf '%s\n' "${rec}" | awk -F '\t' '{print $2}')"
+  payload="$(printf '%s\n' "${rec}" | awk -F '\t' '{s=""; for (i=3;i<=NF;i++) { if (i>3) s=s "\t"; s=s $i } print s}')"
+
+  case "${typ}" in
+    remotelogin)
+      local prev="${payload}"
+      if [[ "${prev}" == "off" ]]; then
+        if confirm "Turn Remote Login back off (sudo systemsetup -setremotelogin off)?"; then
+          run_cmd sudo /usr/sbin/systemsetup -setremotelogin off
+        fi
+      else
+        info "Remote Login was ${prev} before setup; leaving it as it is."
+      fi
+      ;;
+    sshd_dropin)
+      local action path backup
+      action="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $1}')"
+      path="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $2}')"
+      backup="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $3}')"
+      path="${path:-${DROPIN_PATH}}"
+      if [[ "${action}" == "replace" && -n "${backup}" ]]; then
+        if confirm "Restore previous sshd drop-in at ${path}?"; then
+          if [[ "${DRY_RUN}" -eq 1 ]]; then
+            show_cmd sudo cp "${backup}" "${path}"
+          else
+            sudo cp "${backup}" "${path}"
+          fi
+          if confirm "Reload sshd?"; then
+            reload_sshd
+          fi
+        fi
+      else
+        if confirm "Remove sshd hardening drop-in ${path}?"; then
+          run_cmd sudo rm -f "${path}"
+          if confirm "Reload sshd?"; then
+            reload_sshd
+          fi
+        fi
+      fi
+      ;;
+    pmset)
+      local domain key prev
+      domain="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $1}')"
+      key="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $2}')"
+      prev="$(printf '%s\n' "${payload}" | awk -F '\t' '{print $3}')"
+      if [[ -z "${domain}" || -z "${key}" ]]; then
+        info "Skipping malformed pmset record."
+        return 0
+      fi
+      if [[ -z "${prev}" || "${prev}" == "unknown" || "${prev}" == "n/a" ]]; then
+        info "No previous value recorded for pmset ${domain} ${key}; skipping restore."
+        return 0
+      fi
+      if confirm "Restore pmset ${domain} ${key} ${prev}?"; then
+        run_cmd sudo pmset "${domain}" "${key}" "${prev}"
+      fi
+      ;;
+    authorized_key)
+      if confirm "Remove authorized key ${payload} from $(authorized_keys_path)?"; then
+        remove_authorized_key "${payload}"
+      fi
+      ;;
+    tailscale_brew)
+      info "Tailscale was installed via Homebrew; leaving the app in place (uninstall it yourself if you want it gone)."
+      ;;
+    *)
+      info "Skipping unknown state record type: ${typ}"
+      ;;
+  esac
+}
+
+# ---------- argv ----------
+
+parse_args() {
+  local args=()
+  local a
+  for a in "$@"; do
+    args+=("${a}")
+  done
+  local i
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    a="${args[$i]}"
+    case "${a}" in
+      --dry-run) DRY_RUN=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      -h|--help) COMMAND="help" ;;
+      --version|-V) COMMAND="version" ;;
+      -*)
+        die "unknown option: ${a}"
+        ;;
+      *)
+        if [[ -z "${COMMAND}" ]]; then
+          COMMAND="${a}"
+        else
+          POSITIONAL+=("${a}")
+        fi
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  if [[ -z "${COMMAND}" ]]; then
+    usage
+    exit 2
+  fi
+  case "${COMMAND}" in
+    setup) cmd_setup ;;
+    add-key|add_key) cmd_add_key "${POSITIONAL[@]+"${POSITIONAL[@]}"}" ;;
+    status) cmd_status ;;
+    undo) cmd_undo ;;
+    help) usage ;;
+    version) printf 'macserve %s\n' "${VERSION}" ;;
+    *)
+      die "unknown command: ${COMMAND} (try 'macserve help')"
+      ;;
+  esac
+}
+
+main "$@"
